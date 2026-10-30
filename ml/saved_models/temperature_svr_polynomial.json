@@ -1,0 +1,36 @@
+{
+  "target_type": "temperature",
+  "model_name": "SVR Polynomial",
+  "curve_samples": 10,
+  "feature_count": 159,
+  "grid_points": 128,
+  "frequency_min_hz": 800000000.0,
+  "frequency_max_hz": 5000000000.0,
+  "input_curves": [
+    "Magnitude [dB] at tempreture10 degree",
+    "Magnitude [dB] tempreture 20 degree",
+    "Magnitude [dB] tempreture 30 degree",
+    "Magnitude [dB] tempreture 40 degree",
+    "Magnitude [dB]tempreture at 50 degree",
+    "Magnitude [dB]tempreture at 60 degree",
+    "Magnitude [dB]tempreture at 70 degree",
+    "Magnitude [dB]tempreture at 75 degree",
+    "Magnitude [dB]tempreture at 85 degree",
+    "Magnitude [dB] tempreture 90 degree"
+  ],
+  "training_targets": [
+    10.0,
+    20.0,
+    30.0,
+    40.0,
+    50.0,
+    60.0,
+    70.0,
+    75.0,
+    85.0,
+    90.0
+  ],
+  "feature_definition": "Interpolated RF magnitudes plus curve summary features",
+  "validation": "Leave-one-curve-out cross-validation",
+  "evaluation_status": "Exploratory only"
+}

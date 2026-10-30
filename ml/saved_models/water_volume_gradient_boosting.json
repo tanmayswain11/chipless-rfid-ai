@@ -1,0 +1,26 @@
+{
+  "target_type": "water_volume",
+  "model_name": "Gradient Boosting",
+  "curve_samples": 5,
+  "feature_count": 159,
+  "grid_points": 128,
+  "frequency_min_hz": 800000000.0,
+  "frequency_max_hz": 5000000000.0,
+  "input_curves": [
+    "Moisture at 5 ml of water",
+    "Moisture at 10 ml of water",
+    "Moisture at 15 ml of water",
+    "Moisture at 20 ml of water",
+    "Moisture at 25 ml of water"
+  ],
+  "training_targets": [
+    5.0,
+    10.0,
+    15.0,
+    20.0,
+    25.0
+  ],
+  "feature_definition": "Interpolated RF magnitudes plus curve summary features",
+  "validation": "Leave-one-curve-out cross-validation",
+  "evaluation_status": "Exploratory only"
+}

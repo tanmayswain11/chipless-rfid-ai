@@ -1,0 +1,121 @@
+
+# ==============================
+# Python cache and compiled files
+# ==============================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ==============================
+# Virtual environments
+# ==============================
+venv/
+.venv/
+env/
+ENV/
+
+# ==============================
+# Environment variables and secrets
+# ==============================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ==============================
+# Jupyter Notebook
+# ==============================
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ==============================
+# IDE and editor settings
+# ==============================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ==============================
+# Operating system files
+# ==============================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==============================
+# Logs and temporary files
+# ==============================
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+
+# ==============================
+# Machine Learning artifacts
+# ==============================
+ml/saved_models/*.joblib
+ml/saved_models/*.pkl
+ml/saved_models/*.pickle
+ml/saved_models/*.h5
+ml/saved_models/*.pt
+ml/saved_models/*.pth
+ml/saved_models/*.onnx
+
+# ==============================
+# Model training outputs
+# ==============================
+ml/outputs/
+ml/checkpoints/
+runs/
+wandb/
+mlruns/
+
+# ==============================
+# Generated datasets
+# ==============================
+data/processed/*
+!data/processed/.gitkeep
+
+# ==============================
+# Experimental temporary files
+# ==============================
+data/temp/
+data/experimental_metadata/private/
+
+# ==============================
+# Frontend dependencies
+# ==============================
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+
+# ==============================
+# Build and deployment
+# ==============================
+dist/
+build/
+coverage/
+.next/
+.vercel/
+
+# ==============================
+# Database files
+# ==============================
+*.db
+*.sqlite
+*.sqlite3
+
+# ==============================
+# OS and package artifacts
+# ==============================
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

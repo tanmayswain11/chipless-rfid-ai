@@ -1,0 +1,19 @@
+
+name: chipless-rfid-ai
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - joblib
+  - matplotlib
+  - fastapi
+  - uvicorn
+  - pydantic
+  - python-dotenv
+  - requests
+  - pytest
