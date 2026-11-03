@@ -17,3 +17,5 @@ dependencies:
   - python-dotenv
   - requests
   - pytest
+  - streamlit
+  - plotly

@@ -1,49 +1,42 @@
 
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler, PolynomialFeatures
-from sklearn.decomposition import PCA
-from sklearn.linear_model import Ridge
-from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import (
+    ExtraTreesRegressor,
     RandomForestRegressor,
     GradientBoostingRegressor,
-    ExtraTreesRegressor,
 )
+
+from sklearn.tree import DecisionTreeRegressor
 from sklearn.svm import SVR
+from sklearn.linear_model import Ridge
+
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 
+def _build_model_dictionary():
+    """
+    Create the common regression model collection.
 
-def get_models():
-    """Return seven regression models for chipless RFID sensing."""
-
-    # PCA must use fewer components than the smallest CV training fold.
-    # With 5 water-volume samples, LOOCV trains on only 4 samples.
-    pca_components = 2
+    The same model definitions are reused by normal training
+    and experimental RH training.
+    """
 
     models = {
-        "Polynomial Regression": Pipeline([
-            ("scaler", StandardScaler()),
-            ("pca", PCA(n_components=pca_components)),
-            ("poly", PolynomialFeatures(
-                degree=2,
-                include_bias=False,
-            )),
-            ("poly_scaler", StandardScaler()),
-            ("ridge", Ridge(alpha=100.0)),
-        ]),
 
-        "Decision Tree": DecisionTreeRegressor(
-            max_depth=3,
-            min_samples_leaf=2,
+        "Extra Trees": ExtraTreesRegressor(
+            n_estimators=300,
             random_state=42,
+            min_samples_leaf=1,
+            max_features=1.0,
+            n_jobs=-1
         ),
 
         "Random Forest": RandomForestRegressor(
             n_estimators=300,
-            max_features=0.8,
-            min_samples_leaf=2,
             random_state=42,
-            n_jobs=-1,
+            min_samples_leaf=1,
+            max_features=1.0,
+            n_jobs=-1
         ),
 
         "Gradient Boosting": GradientBoostingRegressor(
@@ -51,41 +44,75 @@ def get_models():
             learning_rate=0.03,
             max_depth=2,
             loss="huber",
-            random_state=42,
+            random_state=42
         ),
 
-        "Extra Trees": ExtraTreesRegressor(
-            n_estimators=300,
-            max_features=0.8,
+        "Decision Tree": DecisionTreeRegressor(
+            max_depth=3,
             min_samples_leaf=2,
-            random_state=42,
-            n_jobs=-1,
+            random_state=42
         ),
 
         "SVR RBF": Pipeline([
             ("scaler", StandardScaler()),
-            ("pca", PCA(n_components=pca_components)),
-            ("svr", SVR(
+            ("regressor", SVR(
                 kernel="rbf",
                 C=10.0,
                 epsilon=0.1,
-                gamma="scale",
-            )),
+                gamma="scale"
+            ))
         ]),
 
-        "SVR Polynomial": Pipeline([
+        "Ridge Regression": Pipeline([
             ("scaler", StandardScaler()),
-            ("pca", PCA(n_components=pca_components)),
-            ("svr", SVR(
-                kernel="poly",
-                degree=2,
-                C=1.0,
-                epsilon=0.1,
-                gamma="scale",
-                coef0=1.0,
-            )),
+            ("regressor", Ridge(alpha=10.0))
         ]),
     }
 
     return models
 
+
+def get_models(n_samples):
+    """
+    Models for normal supervised regression.
+
+    Temperature and water-volume datasets must have
+    at least four independent labelled curves.
+    """
+
+    if n_samples < 4:
+        raise ValueError(
+            "Normal model evaluation requires at least "
+            "4 independent labelled curves."
+        )
+
+    return _build_model_dictionary()
+
+
+def get_rh_models(n_samples):
+    """
+    Separate model factory for experimental RH training.
+
+    Allows fitting with three independent labelled curves.
+
+    IMPORTANT:
+    Three samples are not sufficient to establish reliable
+    generalization performance. This function is intended
+    for experimental model fitting only.
+    """
+
+    if n_samples < 3:
+        raise ValueError(
+            "Experimental RH training requires at least "
+            "3 independent labelled curves."
+        )
+
+    return _build_model_dictionary()
+
+
+def get_model_names():
+    """
+    Return all available model names.
+    """
+
+    return list(_build_model_dictionary().keys())

@@ -1,165 +1,373 @@
 
+from __future__ import annotations
+
 import numpy as np
 
-# Sensor operating band
+
+# ==================================================
+# CONFIGURATION
+# ==================================================
+
 FREQ_MIN_HZ = 800e6
 FREQ_MAX_HZ = 5e9
+
 GRID_POINTS = 128
-N_RESONANCES = 5
+
+N_LOCAL_EXTREMA = 5
 
 
-def build_features(frequency_hz, magnitude_db):
-    """
-    Convert one measured frequency-response curve into a fixed-length
-    feature vector.
+# ==================================================
+# 1. LOCAL PEAK AND DIP DETECTION
+# ==================================================
 
-    Input:
-        frequency_hz: frequency values in Hz
-        magnitude_db: measured magnitude/RCS values in dB
+def detect_local_extrema(
+    signal: np.ndarray,
+    find_peaks: bool = True
+) -> np.ndarray:
 
-    Output:
-        128 interpolated magnitudes
-        10 summary features
-        20 resonance features (5 peaks and 5 dips, each with
-        frequency and amplitude)
-    """
+    signal = np.asarray(signal, dtype=float)
 
-    freq = np.asarray(frequency_hz, dtype=float).ravel()
-    mag = np.asarray(magnitude_db, dtype=float).ravel()
+    if len(signal) < 3:
+        return np.array([], dtype=int)
 
-    if freq.size != mag.size:
+    if find_peaks:
+
+        indices = np.where(
+            (signal[1:-1] > signal[:-2])
+            & (signal[1:-1] >= signal[2:])
+        )[0] + 1
+
+    else:
+
+        indices = np.where(
+            (signal[1:-1] < signal[:-2])
+            & (signal[1:-1] <= signal[2:])
+        )[0] + 1
+
+    return indices
+
+
+# ==================================================
+# 2. CLEAN AND INTERPOLATE RF SIGNAL
+# ==================================================
+
+def preprocess_signal(
+    frequency_hz,
+    magnitude_db,
+    freq_min_hz=FREQ_MIN_HZ,
+    freq_max_hz=FREQ_MAX_HZ,
+    grid_points=GRID_POINTS
+):
+
+    frequency = np.asarray(
+        frequency_hz,
+        dtype=float
+    )
+
+    magnitude = np.asarray(
+        magnitude_db,
+        dtype=float
+    )
+
+    if len(frequency) != len(magnitude):
+
         raise ValueError(
-            "Frequency and magnitude arrays must have equal lengths."
+            "Frequency and magnitude lengths do not match."
         )
 
-    # Remove NaN and infinite values.
-    valid = np.isfinite(freq) & np.isfinite(mag)
-    freq = freq[valid]
-    mag = mag[valid]
+    # Remove invalid values.
+    valid = (
+        np.isfinite(frequency)
+        & np.isfinite(magnitude)
+    )
 
-    if freq.size < 20:
-        raise ValueError(
-            "Not enough valid measurements to extract features."
-        )
+    frequency = frequency[valid]
+    magnitude = magnitude[valid]
 
-    # Keep the sensor's specified frequency band.
+    # Select operating frequency range.
     band = (
-        (freq >= FREQ_MIN_HZ)
-        & (freq <= FREQ_MAX_HZ)
+        (frequency >= freq_min_hz)
+        & (frequency <= freq_max_hz)
     )
-    freq = freq[band]
-    mag = mag[band]
 
-    if freq.size < 20:
+    frequency = frequency[band]
+    magnitude = magnitude[band]
+
+    if len(frequency) < 10:
+
         raise ValueError(
-            "Fewer than 20 valid measurements in the 800 MHz–5 GHz band."
+            "Insufficient valid RF points in 800 MHz–5 GHz band."
         )
 
-    # Sort by frequency.
-    order = np.argsort(freq)
-    freq = freq[order]
-    mag = mag[order]
+    # Sort frequency.
+    order = np.argsort(frequency)
 
-    # Average duplicate-frequency readings.
-    unique_freq, inverse = np.unique(
-        freq, return_inverse=True
+    frequency = frequency[order]
+    magnitude = magnitude[order]
+
+    # Average duplicate frequency points.
+    unique_frequency, inverse = np.unique(
+        frequency,
+        return_inverse=True
     )
-    sums = np.bincount(inverse, weights=mag)
-    counts = np.bincount(inverse)
-    unique_mag = sums / counts
 
-    freq = unique_freq
-    mag = unique_mag
+    if len(unique_frequency) != len(frequency):
 
-    # Require coverage of the full operating band.
-    if freq[0] > FREQ_MIN_HZ or freq[-1] < FREQ_MAX_HZ:
-        raise ValueError(
-            "Curve does not cover the full 800 MHz–5 GHz band. "
-            "Check the original measurement file."
+        sums = np.zeros(
+            len(unique_frequency),
+            dtype=float
         )
 
-    # Interpolate onto a common frequency grid.
+        counts = np.zeros(
+            len(unique_frequency),
+            dtype=float
+        )
+
+        np.add.at(
+            sums,
+            inverse,
+            magnitude
+        )
+
+        np.add.at(
+            counts,
+            inverse,
+            1
+        )
+
+        frequency = unique_frequency
+        magnitude = sums / counts
+
+    # Interpolate on a consistent grid.
+    # Use measured endpoints to avoid extrapolating beyond data.
     grid = np.linspace(
-        FREQ_MIN_HZ, FREQ_MAX_HZ, GRID_POINTS
+        frequency[0],
+        frequency[-1],
+        grid_points
     )
-    interpolated = np.interp(grid, freq, mag)
 
-    # Summary statistics.
-    mean_mag = np.mean(interpolated)
-    std_mag = np.std(interpolated)
-    min_mag = np.min(interpolated)
-    max_mag = np.max(interpolated)
-    range_mag = max_mag - min_mag
-    median_mag = np.median(interpolated)
-    p25 = np.percentile(interpolated, 25)
-    p75 = np.percentile(interpolated, 75)
-    variance_mag = np.var(interpolated)
+    interpolated_signal = np.interp(
+        grid,
+        frequency,
+        magnitude
+    )
 
-    peak_idx = int(np.argmax(interpolated))
-    dip_idx = int(np.argmin(interpolated))
+    return grid, interpolated_signal
 
-    summary = np.array([
-        mean_mag,
-        std_mag,
-        min_mag,
-        max_mag,
-        range_mag,
-        median_mag,
-        p25,
-        p75,
-        grid[peak_idx] / 1e9,
-        grid[dip_idx] / 1e9,
-    ])
 
-    # Detect local maxima and minima on the common grid.
-    # A peak is a local maximum; a dip is a local minimum.
-    peaks = np.where(
-        (interpolated[1:-1] > interpolated[:-2])
-        & (interpolated[1:-1] >= interpolated[2:])
-    )[0] + 1
+# ==================================================
+# 3. SUMMARY FEATURES
+# ==================================================
 
-    dips = np.where(
-        (interpolated[1:-1] < interpolated[:-2])
-        & (interpolated[1:-1] <= interpolated[2:])
-    )[0] + 1
+def extract_summary_features(
+    frequency,
+    signal
+):
 
-    # Keep the strongest peaks and deepest dips.
-    peaks = sorted(
-        peaks,
-        key=lambda i: interpolated[i],
-        reverse=True,
-    )[:N_RESONANCES]
+    features = [
 
-    dips = sorted(
-        dips,
-        key=lambda i: interpolated[i],
-    )[:N_RESONANCES]
+        np.mean(signal),
 
-    # Fixed-size features: frequency in GHz and amplitude in dB.
-    # Missing resonance slots are padded with zero.
-    peak_features = np.zeros(N_RESONANCES * 2)
-    dip_features = np.zeros(N_RESONANCES * 2)
+        np.std(signal),
 
-    for j, idx in enumerate(peaks):
-        peak_features[2 * j] = grid[idx] / 1e9
-        peak_features[2 * j + 1] = interpolated[idx]
+        np.min(signal),
 
-    for j, idx in enumerate(dips):
-        dip_features[2 * j] = grid[idx] / 1e9
-        dip_features[2 * j + 1] = interpolated[idx]
+        np.max(signal),
 
-    # Added variance feature.
-    variance_feature = np.array([variance_mag])
+        np.ptp(signal),
 
-    features = np.concatenate([
-        interpolated,       # 128 features
-        summary,            # 10 features
-        variance_feature,   # 1 feature
-        peak_features,      # 10 features
-        dip_features,       # 10 features
-    ])
+        np.median(signal),
 
-    if not np.all(np.isfinite(features)):
-        raise ValueError("Feature extraction produced invalid values.")
+        np.percentile(signal, 25),
+
+        np.percentile(signal, 75),
+
+        frequency[np.argmax(signal)] / 1e9,
+
+        frequency[np.argmin(signal)] / 1e9,
+
+        np.var(signal)
+
+    ]
 
     return features
+
+
+# ==================================================
+# 4. LOCAL PEAK FEATURES
+# ==================================================
+
+def extract_peak_features(
+    frequency,
+    signal
+):
+
+    indices = detect_local_extrema(
+        signal,
+        find_peaks=True
+    )
+
+    # Sort strongest peaks first.
+    if len(indices) > 0:
+
+        indices = indices[
+            np.argsort(signal[indices])[::-1]
+        ]
+
+    indices = indices[:N_LOCAL_EXTREMA]
+
+    features = []
+
+    for i in range(N_LOCAL_EXTREMA):
+
+        if i < len(indices):
+
+            index = indices[i]
+
+            peak_frequency = (
+                frequency[index] / 1e9
+            )
+
+            peak_magnitude = signal[index]
+
+        else:
+
+            peak_frequency = 0.0
+            peak_magnitude = 0.0
+
+        features.extend([
+            peak_frequency,
+            peak_magnitude
+        ])
+
+    return features
+
+
+# ==================================================
+# 5. LOCAL DIP FEATURES
+# ==================================================
+
+def extract_dip_features(
+    frequency,
+    signal
+):
+
+    indices = detect_local_extrema(
+        signal,
+        find_peaks=False
+    )
+
+    # Sort deepest dips first.
+    if len(indices) > 0:
+
+        indices = indices[
+            np.argsort(signal[indices])
+        ]
+
+    indices = indices[:N_LOCAL_EXTREMA]
+
+    features = []
+
+    for i in range(N_LOCAL_EXTREMA):
+
+        if i < len(indices):
+
+            index = indices[i]
+
+            dip_frequency = (
+                frequency[index] / 1e9
+            )
+
+            dip_magnitude = signal[index]
+
+        else:
+
+            dip_frequency = 0.0
+            dip_magnitude = 0.0
+
+        features.extend([
+            dip_frequency,
+            dip_magnitude
+        ])
+
+    return features
+
+
+# ==================================================
+# 6. MAIN FEATURE EXTRACTION FUNCTION
+# ==================================================
+
+def build_features(
+    frequency_hz,
+    magnitude_db
+):
+
+    frequency, signal = preprocess_signal(
+        frequency_hz,
+        magnitude_db
+    )
+
+    features = []
+
+    # Summary features: 11
+    features.extend(
+        extract_summary_features(
+            frequency,
+            signal
+        )
+    )
+
+    # Peak features: 10
+    features.extend(
+        extract_peak_features(
+            frequency,
+            signal
+        )
+    )
+
+    # Dip features: 10
+    features.extend(
+        extract_dip_features(
+            frequency,
+            signal
+        )
+    )
+
+    feature_vector = np.asarray(
+        features,
+        dtype=float
+    )
+
+    if not np.isfinite(feature_vector).all():
+
+        raise ValueError(
+            "Feature vector contains NaN or infinity."
+        )
+
+    return feature_vector
+
+
+# ==================================================
+# 7. BUILD FEATURE MATRIX
+# ==================================================
+
+def build_feature_matrix(samples):
+
+    if not samples:
+
+        raise ValueError(
+            "No RF samples supplied."
+        )
+
+    X = np.vstack([
+
+        build_features(
+            sample["frequency_hz"],
+            sample["magnitude_db"]
+        )
+
+        for sample in samples
+
+    ])
+
+    return X

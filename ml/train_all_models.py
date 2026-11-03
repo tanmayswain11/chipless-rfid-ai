@@ -1,306 +1,774 @@
 
-from pathlib import Path
-import re
+import argparse
 import json
+import re
+
+from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
 
-from ml.feature_extraction import (
-    build_features,
-    FREQ_MIN_HZ,
-    FREQ_MAX_HZ,
-    GRID_POINTS,
+from ml.data_loader import (
+    load_curve_samples,
+    default_dataset_paths,
 )
-from ml.model_zoo import get_models
+
+from ml.preprocessing import samples_to_xy
+
+from ml.model_zoo import (
+    get_models,
+    get_rh_models,
+)
+
 from ml.evaluate_models import evaluate_models
 
 
-# --------------------------------------------------
-# 1. Project paths
-# --------------------------------------------------
+# ============================================================
+# PROJECT PATHS
+# ============================================================
 
 ROOT = Path(__file__).resolve().parents[1]
-OUTPUT_DIR = ROOT / "ml" / "saved_models"
+
+PROCESSED_DIR = ROOT / "data" / "processed"
+MODEL_DIR = ROOT / "saved_models"
+
+PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# --------------------------------------------------
-# 2. Find the frequency column
-# --------------------------------------------------
+# ============================================================
+# TARGET CONFIGURATION
+# ============================================================
 
-def find_frequency_column(df):
-    for col in df.columns:
-        if "freq" in str(col).lower():
-            return col
-
-    raise ValueError(
-        f"Frequency column not found. Available columns: {list(df.columns)}"
-    )
+TARGET_NAMES = {
+    "temperature": "Temperature",
+    "water_volume": "Water Volume",
+    "relative_humidity": "Relative Humidity",
+}
 
 
-# --------------------------------------------------
-# 3. Convert frequency to Hz
-# --------------------------------------------------
+# ============================================================
+# PROVISIONAL RH LABELS
+# ============================================================
 
-def convert_frequency_to_hz(series, column_name):
-    values = pd.to_numeric(series, errors="coerce")
-    name = str(column_name).lower()
+# These values are assumptions for experimentation.
+# They are NOT actual measured RH values.
+#
+# Assignment follows the order of the three response
+# columns in realhumid cf.csv.
 
-    if "ghz" in name:
-        return values * 1e9
-
-    if "mhz" in name:
-        return values * 1e6
-
-    if "khz" in name:
-        return values * 1e3
-
-    median = values.dropna().median()
-
-    if pd.isna(median):
-        raise ValueError("Frequency column contains no numeric values.")
-
-    # Fallback for headers without explicit units.
-    if median < 10:
-        return values * 1e9
-
-    if median < 10000:
-        return values * 1e6
-
-    return values
+PROVISIONAL_RH_LABELS = [30.0, 50.0, 70.0]
 
 
-# --------------------------------------------------
-# 4. Extract temperature or water-volume labels
-# --------------------------------------------------
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
 
-def parse_target(column, target_type):
-    label = str(column).lower()
+def safe_filename(name):
+    """
+    Convert model names into safe filenames.
+    """
 
-    if target_type == "temperature":
-        patterns = [
-            r"(\d+(?:\.\d+)?)\s*degree",
-            r"tempreture\s*(\d+(?:\.\d+)?)",
-            r"temperature\s*(\d+(?:\.\d+)?)",
-        ]
+    name = name.lower().strip()
+    name = re.sub(r"[^a-z0-9]+", "_", name)
 
-    elif target_type == "water_volume":
-        patterns = [
-            r"(\d+(?:\.\d+)?)\s*ml\b",
-        ]
-
-    else:
-        raise ValueError(
-            f"Unknown target type: {target_type}"
-        )
-
-    for pattern in patterns:
-        match = re.search(pattern, label)
-
-        if match:
-            return float(match.group(1))
-
-    return None
+    return name.strip("_")
 
 
-# --------------------------------------------------
-# 5. Load complete curves as independent samples
-# --------------------------------------------------
+def get_labelled_samples(samples):
+    """
+    Keep samples with valid numerical target labels.
+    """
 
-def load_samples(csv_path, target_type):
-    if not csv_path.exists():
-        raise FileNotFoundError(
-            f"CSV file not found: {csv_path}"
-        )
+    labelled_samples = []
 
-    df = pd.read_csv(csv_path)
+    for sample in samples:
 
-    frequency_col = find_frequency_column(df)
-
-    frequency_hz = convert_frequency_to_hz(
-        df[frequency_col],
-        frequency_col,
-    )
-
-    samples = []
-
-    for col in df.columns:
-        if col == frequency_col:
-            continue
-
-        target = parse_target(col, target_type)
+        target = sample.get("target")
 
         if target is None:
             continue
 
-        magnitude = pd.to_numeric(
-            df[col],
-            errors="coerce",
-        )
-
-        valid = frequency_hz.notna() & magnitude.notna()
-
-        if valid.sum() < 20:
-            print(
-                f"WARNING: Skipping {col}: "
-                f"only {valid.sum()} valid measurements."
-            )
+        try:
+            target = float(target)
+        except (TypeError, ValueError):
             continue
 
-        features = build_features(
-            frequency_hz[valid].to_numpy(),
-            magnitude[valid].to_numpy(),
-        )
+        if not np.isfinite(target):
+            continue
 
-        samples.append({
-            "curve": str(col),
-            "target": target,
-            "features": features,
-        })
+        sample["target"] = target
+        labelled_samples.append(sample)
 
-    if not samples:
-        raise ValueError(
-            f"No target curves found in {csv_path.name}. "
-            f"Available columns: {list(df.columns)}"
-        )
-
-    return samples
+    return labelled_samples
 
 
-# --------------------------------------------------
-# 6. Train, cross-validate, and save every algorithm
-# --------------------------------------------------
+# ============================================================
+# NORMAL MODEL TRAINING
+# TEMPERATURE AND WATER VOLUME
+# ============================================================
 
-def train_dataset(csv_path, target_type, output_prefix):
-    samples = load_samples(csv_path, target_type)
+def train_target(
+    target_type,
+    csv_path,
+    copies_per_curve=2,
+    random_state=42
+):
+    """
+    Train and evaluate normal supervised regression targets.
 
-    X = np.vstack([
-        sample["features"]
-        for sample in samples
-    ])
+    Used for:
+        1. Temperature
+        2. Water volume
 
-    y = np.array([
-        sample["target"]
-        for sample in samples
-    ], dtype=float)
+    Uses LOOCV through evaluate_models().
+    """
 
-    labels = [
-        sample["curve"]
-        for sample in samples
-    ]
+    print("\n" + "=" * 65)
+    print(f"TRAINING: {TARGET_NAMES[target_type].upper()}")
+    print("=" * 65)
 
-    print("\n" + "=" * 70)
-    print("Target:", target_type)
-    print("CSV:", csv_path.name)
-    print("Independent curves:", len(samples))
-    print("Feature matrix shape:", X.shape)
-    print("Feature count per curve:", X.shape[1])
-    print("Curve labels:", list(zip(labels, y)))
+    csv_path = Path(csv_path)
 
-    if len(samples) < 3:
-        raise ValueError(
-            "At least three independent curves are required "
-            "for exploratory cross-validation."
-        )
+    if not csv_path.exists():
+        print(f"Dataset not found: {csv_path}")
+        return None
 
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
+    # --------------------------------------------------------
+    # LOAD DATA
+    # --------------------------------------------------------
+
+    samples = load_curve_samples(
+        csv_path,
+        target_type
     )
 
-    # --------------------------------------------------
-    # A. Evaluate all seven models using LOOCV
-    # --------------------------------------------------
+    labelled_samples = get_labelled_samples(samples)
 
-    models = get_models()
+    print(f"Total curves: {len(samples)}")
+    print(f"Labelled curves: {len(labelled_samples)}")
 
-    results = evaluate_models(
-        X=X,
-        y=y,
-        models=models,
-        groups=None,
+    # --------------------------------------------------------
+    # MINIMUM SAMPLE CHECK
+    # --------------------------------------------------------
+
+    if len(labelled_samples) < 4:
+
+        print(
+            f"Skipping {target_type}: "
+            "at least 4 labelled curves are required."
+        )
+
+        return None
+
+    # --------------------------------------------------------
+    # FEATURE EXTRACTION
+    # --------------------------------------------------------
+
+    X, y, labels, labelled_samples = samples_to_xy(
+        labelled_samples
     )
+
+    print("Feature matrix:", X.shape)
+    print("Target shape:", y.shape)
+
+    # --------------------------------------------------------
+    # MODEL EVALUATION
+    # --------------------------------------------------------
+
+    results_df, predictions_df = evaluate_models(
+        labelled_samples,
+        copies_per_curve=copies_per_curve,
+        random_state=random_state
+    )
+
+    if results_df.empty:
+        print("No evaluation results generated.")
+        return None
+
+    # --------------------------------------------------------
+    # SAVE COMPARISON RESULTS
+    # --------------------------------------------------------
 
     results_path = (
-        OUTPUT_DIR / f"{output_prefix}_comparison.csv"
+        PROCESSED_DIR /
+        f"{target_type}_comparison.csv"
     )
 
-    results.to_csv(
+    predictions_path = (
+        PROCESSED_DIR /
+        f"{target_type}_predictions.csv"
+    )
+
+    results_df.to_csv(
         results_path,
-        index=False,
+        index=False
     )
 
-    print("\nCross-validation results:")
-    print(results.to_string(index=False))
-    print("\nComparison saved:", results_path)
+    predictions_df.to_csv(
+        predictions_path,
+        index=False
+    )
 
-    # --------------------------------------------------
-    # B. Save every model fitted on all available curves
-    # --------------------------------------------------
+    # --------------------------------------------------------
+    # SELECT BEST MODEL
+    # --------------------------------------------------------
 
-    for name, model in models.items():
-        fitted_model = model.fit(X, y)
+    # This selection is exploratory because it uses
+    # the same LOOCV results for model comparison.
 
-        safe_name = (
-            name.lower()
-            .replace(" ", "_")
-            .replace("-", "_")
+    best_row = results_df.loc[
+        results_df["MAE"].idxmin()
+    ]
+
+    best_model_name = best_row["model"]
+
+    print("\nBest exploratory model:")
+    print(best_model_name)
+
+    print("MAE:", best_row["MAE"])
+    print("RMSE:", best_row["RMSE"])
+    print("R2:", best_row["R2"])
+
+    # --------------------------------------------------------
+    # FIT FINAL MODEL ON ORIGINAL CURVES
+    # --------------------------------------------------------
+
+    models = get_models(
+        n_samples=len(y)
+    )
+
+    if best_model_name not in models:
+        raise KeyError(
+            f"Model '{best_model_name}' not found "
+            "in model_zoo.py."
         )
 
-        model_path = OUTPUT_DIR / (
-            f"{output_prefix}_{safe_name}.joblib"
+    final_model = models[best_model_name]
+
+    # Fit only on original measured curves.
+    # Synthetic augmentation is not used here.
+
+    final_model.fit(X, y)
+
+    # --------------------------------------------------------
+    # SAVE MODEL
+    # --------------------------------------------------------
+
+    target_model_dir = MODEL_DIR / target_type
+    target_model_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    model_filename = (
+        f"{target_type}_"
+        f"{safe_filename(best_model_name)}.joblib"
+    )
+
+    model_path = target_model_dir / model_filename
+
+    model_package = {
+
+        "model": final_model,
+
+        "target_type": target_type,
+
+        "target_name": TARGET_NAMES[target_type],
+
+        "model_name": best_model_name,
+
+        "feature_count": int(X.shape[1]),
+
+        "training_samples": int(len(y)),
+
+        "training_labels": y.tolist(),
+
+        "curve_labels": labels,
+
+        "selection_experiment": best_row["experiment"],
+
+        "evaluation_metrics": {
+            "MAE": float(best_row["MAE"]),
+            "RMSE": float(best_row["RMSE"]),
+            "R2": float(best_row["R2"]),
+        },
+
+        "evaluation_method": "LOOCV",
+
+        "label_status": "dataset_labels",
+
+        "experimental": False,
+    }
+
+    joblib.dump(
+        model_package,
+        model_path
+    )
+
+    print("\nModel saved:", model_path)
+
+    # --------------------------------------------------------
+    # SAVE SUMMARY
+    # --------------------------------------------------------
+
+    summary = {
+
+        "target": target_type,
+
+        "target_name": TARGET_NAMES[target_type],
+
+        "best_model": best_model_name,
+
+        "independent_samples": int(len(y)),
+
+        "feature_count": int(X.shape[1]),
+
+        "MAE": float(best_row["MAE"]),
+
+        "RMSE": float(best_row["RMSE"]),
+
+        "R2": float(best_row["R2"]),
+
+        "model_path": str(model_path),
+
+        "experimental": False,
+    }
+
+    summary_path = (
+        PROCESSED_DIR /
+        f"{target_type}_summary.json"
+    )
+
+    with open(summary_path, "w", encoding="utf-8") as file:
+        json.dump(
+            summary,
+            file,
+            indent=4
         )
 
-        joblib.dump(
-            fitted_model,
-            model_path,
+    return summary
+
+
+# ============================================================
+# SEPARATE RELATIVE HUMIDITY TRAINING
+# ============================================================
+
+def train_relative_humidity(
+    csv_path,
+    random_state=42
+):
+    """
+    Separate experimental RH training function.
+
+    Uses three independent RF response curves.
+
+    Provisional RH labels:
+        Curve 1 -> 30%
+        Curve 2 -> 50%
+        Curve 3 -> 70%
+
+    Does NOT perform LOOCV model selection.
+    Does NOT claim validation accuracy.
+
+    All six models are fitted using the three original curves.
+    """
+
+    print("\n" + "=" * 65)
+    print("EXPERIMENTAL RELATIVE HUMIDITY TRAINING")
+    print("=" * 65)
+
+    csv_path = Path(csv_path)
+
+    if not csv_path.exists():
+        print(f"RH dataset not found: {csv_path}")
+        return None
+
+    # --------------------------------------------------------
+    # LOAD DATA
+    # --------------------------------------------------------
+
+    samples = load_curve_samples(
+        csv_path,
+        "relative_humidity"
+    )
+
+    print("Total RH response curves:", len(samples))
+
+    # --------------------------------------------------------
+    # ASSIGN PROVISIONAL LABELS
+    # --------------------------------------------------------
+
+    if len(samples) != 3:
+
+        raise ValueError(
+            "Expected exactly 3 RH response curves in "
+            f"{csv_path.name}, but found {len(samples)}. "
+            "Check the CSV columns and curve order."
         )
 
-        metadata = {
-            "target_type": target_type,
-            "model_name": name,
-            "curve_samples": len(samples),
+    for sample, rh_value in zip(
+        samples,
+        PROVISIONAL_RH_LABELS
+    ):
+
+        sample["target"] = float(rh_value)
+
+        sample["target_source"] = (
+            "provisional_assumption"
+        )
+
+        sample["is_verified_label"] = False
+
+    print("\nProvisional RH labels:")
+
+    for sample in samples:
+
+        print(
+            f"Curve: {sample['curve']} | "
+            f"Assigned RH: {sample['target']}% | "
+            f"Verified: {sample['is_verified_label']}"
+        )
+
+    # --------------------------------------------------------
+    # FEATURE EXTRACTION
+    # --------------------------------------------------------
+
+    X, y, labels, labelled_samples = samples_to_xy(
+        samples
+    )
+
+    if len(y) != 3:
+
+        raise ValueError(
+            "RH feature extraction did not return "
+            "exactly three labelled samples."
+        )
+
+    print("\nRH feature matrix:", X.shape)
+    print("RH target shape:", y.shape)
+
+    # --------------------------------------------------------
+    # GET SEPARATE RH MODELS
+    # --------------------------------------------------------
+
+    models = get_rh_models(
+        n_samples=len(y)
+    )
+
+    # --------------------------------------------------------
+    # OUTPUT DIRECTORIES
+    # --------------------------------------------------------
+
+    rh_model_dir = MODEL_DIR / "relative_humidity"
+
+    rh_model_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    # --------------------------------------------------------
+    # FIT AND SAVE ALL RH MODELS
+    # --------------------------------------------------------
+
+    training_predictions = []
+
+    for model_name, model in models.items():
+
+        print("\nTraining:", model_name)
+
+        model.fit(X, y)
+
+        predictions = model.predict(X)
+
+        model_filename = (
+            "relative_humidity_"
+            f"{safe_filename(model_name)}.joblib"
+        )
+
+        model_path = (
+            rh_model_dir / model_filename
+        )
+
+        model_package = {
+
+            "model": model,
+
+            "target_type": "relative_humidity",
+
+            "target_name": "Relative Humidity",
+
+            "model_name": model_name,
+
             "feature_count": int(X.shape[1]),
-            "grid_points": GRID_POINTS,
-            "frequency_min_hz": FREQ_MIN_HZ,
-            "frequency_max_hz": FREQ_MAX_HZ,
-            "input_curves": labels,
-            "training_targets": y.tolist(),
-            "feature_definition": (
-                "Interpolated RF magnitudes plus curve summary features"
+
+            "training_samples": int(len(y)),
+
+            "training_labels": y.tolist(),
+
+            "curve_labels": labels,
+
+            "provisional_labels": PROVISIONAL_RH_LABELS,
+
+            "label_status": "assumed_not_measured",
+
+            "experimental": True,
+
+            "evaluation_method": (
+                "Training fit only - no independent validation"
             ),
-            "validation": "Leave-one-curve-out cross-validation",
-            "evaluation_status": "Exploratory only",
+
+            "warning": (
+                "RH labels are provisional assumptions. "
+                "Predictions are not validated real-world "
+                "humidity measurements."
+            ),
         }
 
-        metadata_path = model_path.with_suffix(".json")
-
-        metadata_path.write_text(
-            json.dumps(metadata, indent=2),
-            encoding="utf-8",
+        joblib.dump(
+            model_package,
+            model_path
         )
 
-        print("Saved model:", model_path.name)
-        print("Saved metadata:", metadata_path.name)
+        print("Saved:", model_path)
 
-    print("\nFinished:", target_type)
+        # ----------------------------------------------------
+        # RECORD TRAINING FIT PREDICTIONS
+        # ----------------------------------------------------
+
+        for index in range(len(y)):
+
+            training_predictions.append({
+
+                "model": model_name,
+
+                "curve": labels[index],
+
+                "assumed_actual_rh": float(y[index]),
+
+                "training_prediction_rh": float(
+                    predictions[index]
+                ),
+
+                "prediction_error": float(
+                    predictions[index] - y[index]
+                ),
+
+                "label_status": "provisional_assumption",
+
+                "independent_validation": False,
+            })
+
+    # --------------------------------------------------------
+    # SAVE RH TRAINING PREDICTIONS
+    # --------------------------------------------------------
+
+    predictions_df = pd.DataFrame(
+        training_predictions
+    )
+
+    predictions_path = (
+        PROCESSED_DIR /
+        "relative_humidity_training_predictions.csv"
+    )
+
+    predictions_df.to_csv(
+        predictions_path,
+        index=False
+    )
+
+    # --------------------------------------------------------
+    # SAVE RH TRAINING SUMMARY
+    # --------------------------------------------------------
+
+    summary = {
+
+        "target": "relative_humidity",
+
+        "target_name": "Relative Humidity",
+
+        "training_method": "Experimental model fitting",
+
+        "independent_samples": 3,
+
+        "feature_count": int(X.shape[1]),
+
+        "models_trained": list(models.keys()),
+
+        "provisional_rh_labels": PROVISIONAL_RH_LABELS,
+
+        "label_status": "assumed_not_measured",
+
+        "validation_performed": False,
+
+        "training_predictions_file": str(
+            predictions_path
+        ),
+
+        "model_directory": str(
+            rh_model_dir
+        ),
+
+        "experimental": True,
+
+        "warning": (
+            "The three RH labels are assumptions, not "
+            "measured humidity values. Training fit "
+            "predictions are not independent validation."
+        ),
+    }
+
+    summary_path = (
+        PROCESSED_DIR /
+        "relative_humidity_summary.json"
+    )
+
+    with open(
+        summary_path,
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            summary,
+            file,
+            indent=4
+        )
+
+    print("\n" + "=" * 65)
+    print("RH EXPERIMENTAL TRAINING COMPLETED")
+    print("=" * 65)
+
+    print("Independent curves:", len(y))
+    print("Models trained:", len(models))
+    print("RH labels:", PROVISIONAL_RH_LABELS)
+
+    print("Predictions saved:", predictions_path)
+    print("Summary saved:", summary_path)
+
+    return summary
 
 
-# --------------------------------------------------
-# 7. Run temperature and water-volume experiments
-# --------------------------------------------------
+# ============================================================
+# MAIN TRAINING PIPELINE
+# ============================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train chipless RFID multiparameter "
+            "regression models."
+        )
+    )
+
+    parser.add_argument(
+        "--target",
+        type=str,
+        default="all",
+        choices=[
+            "all",
+            "temperature",
+            "water_volume",
+            "relative_humidity",
+        ],
+        help="Select the target dataset."
+    )
+
+    parser.add_argument(
+        "--copies",
+        type=int,
+        default=2,
+        help="Synthetic training copies per curve."
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed."
+    )
+
+    args = parser.parse_args()
+
+    dataset_paths = default_dataset_paths()
+
+    summaries = []
+
+    # --------------------------------------------------------
+    # TEMPERATURE
+    # --------------------------------------------------------
+
+    if args.target in ["all", "temperature"]:
+
+        summary = train_target(
+            target_type="temperature",
+            csv_path=dataset_paths["temperature"],
+            copies_per_curve=args.copies,
+            random_state=args.seed
+        )
+
+        if summary is not None:
+            summaries.append(summary)
+
+    # --------------------------------------------------------
+    # WATER VOLUME
+    # --------------------------------------------------------
+
+    if args.target in ["all", "water_volume"]:
+
+        summary = train_target(
+            target_type="water_volume",
+            csv_path=dataset_paths["water_volume"],
+            copies_per_curve=args.copies,
+            random_state=args.seed
+        )
+
+        if summary is not None:
+            summaries.append(summary)
+
+    # --------------------------------------------------------
+    # RELATIVE HUMIDITY
+    # --------------------------------------------------------
+
+    if args.target in ["all", "relative_humidity"]:
+
+        summary = train_relative_humidity(
+            csv_path=dataset_paths["relative_humidity"],
+            random_state=args.seed
+        )
+
+        if summary is not None:
+            summaries.append(summary)
+
+    # --------------------------------------------------------
+    # SAVE OVERALL TRAINING SUMMARY
+    # --------------------------------------------------------
+
+    if summaries:
+
+        summary_df = pd.DataFrame(summaries)
+
+        summary_path = (
+            PROCESSED_DIR /
+            "training_summary.csv"
+        )
+
+        summary_df.to_csv(
+            summary_path,
+            index=False
+        )
+
+        print("\nOverall training summary saved:")
+        print(summary_path)
+
+    print("\nTraining pipeline finished.")
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
-
-    train_dataset(
-        ROOT / "data" / "raw" / "plot1_rcs.csv",
-        "temperature",
-        "temperature",
-    )
-
-    train_dataset(
-        ROOT / "data" / "raw" / "moisture1.csv",
-        "water_volume",
-        "water_volume",
-    )
+    main()
